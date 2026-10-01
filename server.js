@@ -6,6 +6,9 @@ const jwt = require('jsonwebtoken');
 const app = express();
 const port = process.env.PORT || 3000;
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+// Data gate only: staging seeds demo rows and production runs against real
+// data. No feature, screen or code path is switched by this flag.
+const IS_STAGING = process.env.USERNODE_ENV === 'staging';
 
 // The platform signs user-identity tokens with an RSA private key it never
 // shares. Containers get only the PUBLIC half, so this app can verify who a
@@ -100,7 +103,12 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+app.get('/health', (_req, res) => {
+  // 503 while draining: anything polling readiness sees this container
+  // leaving rotation instead of a connection reset.
+  if (shuttingDown) return res.status(503).json({ status: 'shutting down' });
+  res.json({ status: 'ok' });
+});
 
 // The template ships no favicon file; index.html carries an inline SVG
 // icon instead. Answer 204 here so anything that still probes
@@ -109,29 +117,111 @@ app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 // fresh load.
 app.get('/favicon.ico', (_req, res) => res.status(204).end());
 
-// Button press
-app.post('/api/press', async (req, res) => {
+// ---------------------------------------------------------------------------
+// Events API
+// ---------------------------------------------------------------------------
+
+// Event list, filterable upcoming/past. Going count and the caller's own
+// Going state come along so a card can show both in one request.
+app.get('/api/events', async (req, res) => {
+  const past = req.query.filter === 'past';
   try {
-    await pool.query(`
-      INSERT INTO presses (user_id, username) VALUES ($1, $2)
-    `, [req.user.id, req.user.username]);
-    res.json({ ok: true });
+    const { rows } = await pool.query(`
+      SELECT e.id, e.title, e.starts_at, e.location, e.creator_username,
+             COUNT(g.user_id)::int AS going_count,
+             BOOL_OR(g.user_id = $1) AS is_going
+      FROM events e
+      LEFT JOIN going g ON g.event_id = e.id
+      WHERE e.starts_at ${past ? '<' : '>='} NOW()
+      GROUP BY e.id
+      ORDER BY e.starts_at ${past ? 'DESC' : 'ASC'}
+      LIMIT 100
+    `, [req.user.id]);
+    res.json({ events: rows.map(r => ({ ...r, is_going: !!r.is_going })) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Leaderboard
-app.get('/api/leaderboard', async (_req, res) => {
+// Create an event. Title needs at least 3 characters; a when and a where
+// are both required.
+app.post('/api/events', async (req, res) => {
+  const title = typeof req.body.title === 'string' ? req.body.title.trim() : '';
+  const location = typeof req.body.location === 'string' ? req.body.location.trim() : '';
+  const startsAt = new Date(req.body.starts_at || '');
+  if (title.length < 3 || title.length > 200) {
+    return res.status(400).json({ error: 'Title needs at least 3 characters.' });
+  }
+  if (!location.length || location.length > 200) {
+    return res.status(400).json({ error: 'Add a location.' });
+  }
+  if (isNaN(startsAt.getTime())) {
+    return res.status(400).json({ error: 'Pick a date and time.' });
+  }
   try {
     const { rows } = await pool.query(`
-      SELECT username, COUNT(*) as presses
-      FROM presses
-      GROUP BY username
-      ORDER BY presses DESC
-      LIMIT 50
-    `);
-    res.json({ leaderboard: rows });
+      INSERT INTO events (title, starts_at, location, created_by, creator_username)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING id
+    `, [title, startsAt.toISOString(), location, req.user.id, req.user.username]);
+    res.json({ id: rows[0].id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Event detail: the event plus its attendee list.
+app.get('/api/events/:id', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(404).json({ error: 'Event not found' });
+  try {
+    const { rows } = await pool.query(`
+      SELECT id, title, starts_at, location, creator_username
+      FROM events WHERE id = $1
+    `, [id]);
+    if (!rows.length) return res.status(404).json({ error: 'Event not found' });
+    const { rows: attendees } = await pool.query(`
+      SELECT user_id, username FROM going WHERE event_id = $1 ORDER BY created_at ASC
+    `, [id]);
+    res.json({
+      event: rows[0],
+      attendees,
+      is_going: attendees.some(a => a.user_id === req.user.id),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Going toggle. One Going per user is enforced by the UNIQUE constraint on
+// (event_id, user_id); posting again cancels it.
+app.post('/api/events/:id/going', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(404).json({ error: 'Event not found' });
+  try {
+    const exists = await pool.query(
+      `SELECT 1 FROM events WHERE id = $1`, [id]);
+    if (!exists.rows.length) return res.status(404).json({ error: 'Event not found' });
+
+    const mine = await pool.query(
+      `SELECT 1 FROM going WHERE event_id = $1 AND user_id = $2`,
+      [id, req.user.id]);
+    let going;
+    if (mine.rows.length) {
+      await pool.query(`DELETE FROM going WHERE event_id = $1 AND user_id = $2`,
+        [id, req.user.id]);
+      going = false;
+    } else {
+      await pool.query(
+        `INSERT INTO going (event_id, user_id, username) VALUES ($1, $2, $3)`,
+        [id, req.user.id, req.user.username]);
+      going = true;
+    }
+    const { rows } = await pool.query(
+      `SELECT user_id, username, (user_id = $2) AS mine FROM going
+       WHERE event_id = $1 ORDER BY created_at ASC`,
+      [id, req.user.id]);
+    res.json({ going, going_count: rows.length, attendees: rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -176,16 +266,94 @@ app.get('*', (req, res) => {
 
 async function start() {
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS presses (
+    CREATE TABLE IF NOT EXISTS events (
       id SERIAL PRIMARY KEY,
-      user_id INTEGER NOT NULL,
-      username VARCHAR(255) NOT NULL,
+      title VARCHAR(200) NOT NULL,
+      starts_at TIMESTAMPTZ NOT NULL,
+      location VARCHAR(200) NOT NULL,
+      created_by INTEGER NOT NULL,
+      creator_username VARCHAR(255) NOT NULL,
       created_at TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS going (
+      event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+      user_id INTEGER NOT NULL,
+      username VARCHAR(255) NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE (event_id, user_id)
+    )
+  `);
+
+  // Staging preview data: a handful of obviously-fake demo events so the
+  // list, detail and create flows are reviewable against the empty
+  // staging database. Fake identities only, idempotent on every boot.
+  // Strictly a no-op outside staging.
+  if (IS_STAGING) {
+    await pool.query(`
+      INSERT INTO events (id, title, starts_at, location, created_by, creator_username)
+      VALUES
+        (900001, 'Staging demo: Neighbourhood cleanup',
+         NOW() + INTERVAL '3 days', 'Community park, main gate',
+         900001, 'staging-demo-user'),
+        (900002, 'Staging demo: Board games evening',
+         NOW() + INTERVAL '7 days', 'Library meeting room',
+         900001, 'staging-demo-user'),
+        (900003, 'Staging demo: Autumn book swap',
+         NOW() - INTERVAL '5 days', 'Cafe on 5th Street',
+         900001, 'staging-demo-user')
+      ON CONFLICT (id) DO NOTHING
+    `);
+    await pool.query(`
+      INSERT INTO going (event_id, user_id, username)
+      VALUES
+        (900001, 900001, 'staging-demo-user'),
+        (900001, 900002, 'staging-demo-user-2'),
+        (900002, 900002, 'staging-demo-user-2'),
+        (900003, 900002, 'staging-demo-user-2')
+      ON CONFLICT (event_id, user_id) DO NOTHING
+    `);
+    // Explicit seed ids must not swallow ids a real INSERT picks next.
+    await pool.query(`
+      SELECT setval('events_id_seq',
+        GREATEST((SELECT MAX(id) FROM events), 1))
+    `);
+  }
+
   const server = app.listen(port, () => console.log(`Listening on :${port}`));
   // Let Envoy retire idle upstream connections at 60s, with a 15s margin.
   server.keepAliveTimeout = 75_000;
+
+  // Graceful shutdown: stop accepting connections, drain in-flight
+  // requests under a hard deadline, close the pool, exit. Idempotent, so
+  // a repeat signal during the drain is a no-op.
+  shutdownServer = server;
 }
+
+const DRAIN_MS = 3000;
+let shuttingDown = false;
+let shutdownServer = null;
+
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[shutdown] ${signal} received, draining`);
+  if (shutdownServer) {
+    shutdownServer.close(() => {});
+    shutdownServer.closeIdleConnections?.();
+    const t = setTimeout(() => shutdownServer.closeAllConnections?.(), DRAIN_MS);
+    t.unref?.();
+  }
+  try {
+    await pool.end();
+  } catch (e) {
+    console.error('[shutdown] pool.end failed', e.message);
+  }
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
 start().catch(err => { console.error(err); process.exit(1); });
