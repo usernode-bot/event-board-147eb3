@@ -1,4 +1,29 @@
 {
   "description": "Board for community events with RSVP Going, reminders, and attendee list.",
-  "secrets": []
+  "secrets": [],
+  "tests": [
+    {
+      "id": "events.list",
+      "name": "Event list renders with demo events",
+      "path": "/",
+      "expectSelector": "#event-list",
+      "expectText": "Staging demo",
+      "visual": true,
+      "impact": ["public/index.html", "server.js", "dapp.json"]
+    },
+    {
+      "id": "events.create-form",
+      "name": "Create event form renders",
+      "path": "/new",
+      "expectSelector": "#event-title",
+      "expectText": "Create event",
+      "visual": true,
+      "impact": ["public/index.html", "server.js", "dapp.json"]
+    },
+    {
+      "name": "Event detail shows attendees and Going",
+      "path": "/event/900001",
+      "expectText": "Neighbourhood cleanup"
+    }
+  ]
 }
